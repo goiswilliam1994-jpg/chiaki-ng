@@ -140,6 +140,8 @@ class SdeckHapticsWorker;
 			bool stretch);
 };
 
+class Passthrough;
+
 struct MicBuf
 {
 	int16_t *buf;
@@ -244,6 +246,7 @@ class StreamSession : public QObject
 		bool session_started;
 
 		ChiakiFfmpegDecoder *ffmpeg_decoder;
+		Passthrough *passthrough = nullptr;
 		void TriggerFfmpegFrameAvailable();
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 		ChiakiPiDecoder *pi_decoder;

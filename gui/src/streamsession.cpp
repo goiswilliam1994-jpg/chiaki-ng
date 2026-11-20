@@ -3,6 +3,7 @@
 #include <streamsession.h>
 #include <settings.h>
 #include <controllermanager.h>
+#include <passthrough.h>
 
 #include <chiaki/base64.h>
 #include <chiaki/streamconnection.h>
@@ -11,9 +12,11 @@
 #include <chiaki/time.h>
 #include "../../lib/src/utils.h"
 
+#include <QHostAddress>
 #include <QKeyEvent>
 #include <QMutexLocker>
 #include <QtMath>
+#include <QUdpSocket>
 #include <atomic>
 
 #include <algorithm>
@@ -404,6 +407,8 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	player_index = 0;
 	memset(led_color, 0, sizeof(led_color));
 	packet_loss_max = connect_info.packet_loss_max;
+	// CHIAKI_PASSTHROUGH_PORT=n also sends the console's video, as is, to 127.0.0.1:n (see passthrough.h)
+	int passthrough_port = qEnvironmentVariableIntValue("CHIAKI_PASSTHROUGH_PORT");
 	ChiakiErrorCode err;
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 	if(connect_info.decoder == Decoder::Pi)
@@ -420,7 +425,7 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 		chiaki_log_sniffer_init(&sniffer, CHIAKI_LOG_ALL, GetChiakiLog());
 		err = chiaki_ffmpeg_decoder_init(ffmpeg_decoder,
 				chiaki_log_sniffer_get_log(&sniffer),
-				chiaki_target_is_ps5(connect_info.target) ? connect_info.video_profile.codec : CHIAKI_CODEC_H264,
+				chiaki_target_is_ps5(connect_info.target) && !passthrough_port ? connect_info.video_profile.codec : CHIAKI_CODEC_H264,
 				connect_info.video_profile.max_fps,
 				connect_info.hw_decoder.isEmpty() ? NULL : connect_info.hw_decoder.toUtf8().constData(),
 				connect_info.hw_device_ctx, FfmpegFrameCb, this);
@@ -432,6 +437,8 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 		}
 		chiaki_log_sniffer_fini(&sniffer);
 		ffmpeg_decoder->log = GetChiakiLog();
+		if(passthrough_port)
+			passthrough = new Passthrough(passthrough_port, ffmpeg_decoder, GetChiakiLog());
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 	}
 #endif
@@ -470,6 +477,8 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	chiaki_connect_info.ps5 = chiaki_target_is_ps5(connect_info.target);
 	chiaki_connect_info.host = host_str.constData();
 	chiaki_connect_info.video_profile = connect_info.video_profile;
+	if(passthrough_port)
+		chiaki_connect_info.video_profile.codec = CHIAKI_CODEC_H264; // what browsers decode
 	chiaki_connect_info.video_profile_auto_downgrade = true;
 	chiaki_connect_info.enable_keyboard = false;
 	chiaki_connect_info.enable_idr_on_fec_failure = connect_info.enable_idr_on_fec_failure;
@@ -582,12 +591,33 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	else
 	{
 #endif
-		chiaki_session_set_video_sample_cb(&session, chiaki_ffmpeg_decoder_video_sample_cb, ffmpeg_decoder);
+		if(passthrough)
+			chiaki_session_set_video_sample_cb(&session, Passthrough::VideoSampleCb, passthrough);
+		else
+			chiaki_session_set_video_sample_cb(&session, chiaki_ffmpeg_decoder_video_sample_cb, ffmpeg_decoder);
 #if CHIAKI_LIB_ENABLE_PI_DECODER
 	}
 #endif
 
 	chiaki_session_set_event_cb(&session, EventCb, this);
+
+	if(passthrough)
+	{
+		// Any datagram on the next port asks the console for a key frame, so a viewer who just joined gets a picture.
+		// Unlike RequestIDR() it does not wait for the key frame, so the local picture keeps going meanwhile.
+		auto key_frame_requests = new QUdpSocket(this);
+		if(!key_frame_requests->bind(QHostAddress::LocalHost, passthrough_port + 1))
+			CHIAKI_LOGE(GetChiakiLog(), "Passthrough: can't listen for key frame requests on port %d", passthrough_port + 1);
+		connect(key_frame_requests, &QUdpSocket::readyRead, this, [this, key_frame_requests]() {
+			char ignored[64];
+			while(key_frame_requests->hasPendingDatagrams())
+				key_frame_requests->readDatagram(ignored, sizeof(ignored));
+			if(!connected)
+				return;
+			ChiakiErrorCode err = chiaki_session_request_idr(&session);
+			CHIAKI_LOGI(GetChiakiLog(), "Passthrough: key frame requested: %s", chiaki_error_string(err));
+		});
+	}
 
 #if CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
 	connect(ControllerManager::GetInstance(), &ControllerManager::AvailableControllersUpdated, this, &StreamSession::UpdateGamepads);
@@ -777,6 +807,7 @@ StreamSession::~StreamSession()
 		free(pi_decoder);
 	}
 #endif
+	delete passthrough;
 	if(ffmpeg_decoder)
 	{
 		chiaki_ffmpeg_decoder_fini(ffmpeg_decoder);
