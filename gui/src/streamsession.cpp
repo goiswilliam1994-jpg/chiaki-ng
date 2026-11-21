@@ -567,6 +567,8 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 	chiaki_opus_decoder_set_cb(&opus_decoder, AudioSettingsCb, AudioFrameCb, this);
 	ChiakiAudioSink audio_sink;
 	chiaki_opus_decoder_get_sink(&opus_decoder, &audio_sink);
+	if(passthrough)
+		audio_sink = passthrough->WrapAudioSink(audio_sink); // the console's sound goes out too, on the picture's clock
 	chiaki_session_set_audio_sink(&session, &audio_sink);
 	ChiakiAudioHeader audio_header;
 	chiaki_audio_header_set(&audio_header, 2, 16, MICROPHONE_SAMPLES * 100, MICROPHONE_SAMPLES);

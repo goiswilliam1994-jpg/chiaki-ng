@@ -4,10 +4,13 @@
 
 #include <chiaki/log.h>
 
+#include <cstring>
 #include <string>
 
 extern "C" {
 #include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/mem.h>
 #include <libavutil/time.h>
 }
 
@@ -21,19 +24,33 @@ Passthrough::Passthrough(int port, ChiakiFfmpegDecoder *decoder, ChiakiLog *log)
 		CHIAKI_LOGE(log, "Passthrough: no MPEG-TS muxer");
 		return;
 	}
-	AVStream *stream = avformat_new_stream(mux, nullptr);
+	AVStream *video = avformat_new_stream(mux, nullptr);
+	AVStream *sound = avformat_new_stream(mux, nullptr);
 	packet = av_packet_alloc();
-	if(!stream || !packet)
+	// OpusHead: version 1, 2 channels, no pre-skip, 48000 Hz, no gain, mapping family 0 (the TS muxer reads the channels from it)
+	static const uint8_t opus_head[19] = { 'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0 };
+	uint8_t *extradata = (uint8_t *)av_mallocz(sizeof(opus_head) + AV_INPUT_BUFFER_PADDING_SIZE);
+	if(!video || !sound || !packet || !extradata)
 	{
+		av_free(extradata);
 		CHIAKI_LOGE(log, "Passthrough: out of memory");
 		return;
 	}
-	stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-	stream->codecpar->codec_id = AV_CODEC_ID_H264;
-	stream->time_base = AVRational{1, 90000};
+	video->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+	video->codecpar->codec_id = AV_CODEC_ID_H264;
+	video->time_base = AVRational{1, 90000};
+	sound->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+	sound->codecpar->codec_id = AV_CODEC_ID_OPUS;
+	sound->codecpar->sample_rate = 48000;
+	av_channel_layout_default(&sound->codecpar->ch_layout, 2);
+	memcpy(extradata, opus_head, sizeof(opus_head));
+	sound->codecpar->extradata = extradata;
+	sound->codecpar->extradata_size = sizeof(opus_head);
+	sound->time_base = AVRational{1, 90000};
 
 	AVDictionary *options = nullptr;
 	av_dict_set(&options, "flush_packets", "1", 0); // each frame leaves right away
+	av_dict_set(&options, "pes_payload_size", "0", 0); // the muxer would hold 10 ms Opus packets until ~3 KB piled up
 	bool ok = avio_open(&mux->pb, url.c_str(), AVIO_FLAG_WRITE) >= 0
 		&& avformat_write_header(mux, &options) >= 0;
 	av_dict_free(&options);
@@ -43,7 +60,7 @@ Passthrough::Passthrough(int port, ChiakiFfmpegDecoder *decoder, ChiakiLog *log)
 		return;
 	}
 	open = true;
-	CHIAKI_LOGI(log, "Passthrough: sending the console's video to %s", url.c_str());
+	CHIAKI_LOGI(log, "Passthrough: sending the console's video and sound to %s", url.c_str());
 }
 
 Passthrough::~Passthrough()
@@ -66,8 +83,46 @@ bool Passthrough::VideoSampleCb(uint8_t *buf, size_t buf_size, int32_t frames_lo
 	return chiaki_ffmpeg_decoder_video_sample_cb(buf, buf_size, frames_lost, frame_recovered, passthrough->decoder);
 }
 
+ChiakiAudioSink Passthrough::WrapAudioSink(ChiakiAudioSink inner)
+{
+	audio_inner = inner;
+	ChiakiAudioSink sink = {};
+	sink.user = this;
+	sink.header_cb = AudioHeaderCb;
+	sink.frame_cb = AudioFrameCb;
+	return sink;
+}
+
+void Passthrough::AudioHeaderCb(ChiakiAudioHeader *header, void *user)
+{
+	auto passthrough = static_cast<Passthrough *>(user);
+	if(header->rate && header->frame_size)
+		passthrough->audio_frame_90k = (int64_t)header->frame_size * 90000 / header->rate;
+	if(passthrough->audio_inner.header_cb)
+		passthrough->audio_inner.header_cb(header, passthrough->audio_inner.user);
+}
+
+void Passthrough::AudioFrameCb(uint8_t *buf, size_t buf_size, void *user)
+{
+	auto passthrough = static_cast<Passthrough *>(user);
+	if(passthrough->open)
+		passthrough->WriteAudio(buf, buf_size);
+	if(passthrough->audio_inner.frame_cb)
+		passthrough->audio_inner.frame_cb(buf, buf_size, passthrough->audio_inner.user);
+}
+
+int64_t Passthrough::Now90k()
+{
+	// chiaki gives no timestamps; arrival time is what a live viewer needs, and one clock keeps picture and sound together
+	int64_t now_us = av_gettime_relative();
+	if(start_us < 0)
+		start_us = now_us;
+	return (now_us - start_us) * 9 / 100;
+}
+
 void Passthrough::Write(const uint8_t *buf, size_t size)
 {
+	std::lock_guard<std::mutex> lock(mux_mutex);
 	while(size && !buf[size - 1]) // chiaki keeps zero padding after the data
 		size--;
 
@@ -100,19 +155,31 @@ void Passthrough::Write(const uint8_t *buf, size_t size)
 		buf = joined.data();
 		size = joined.size();
 	}
+	Send(0, buf, size, Now90k(), key);
+}
 
-	// chiaki gives no timestamps; arrival time is what a live viewer needs anyway
-	int64_t now_us = av_gettime_relative();
-	if(start_us < 0)
-		start_us = now_us;
-	int64_t pts = av_rescale_q(now_us - start_us, AVRational{1, 1000000}, mux->streams[0]->time_base);
-	if(pts <= last_pts)
-		pts = last_pts + 1;
-	last_pts = pts;
+void Passthrough::WriteAudio(const uint8_t *buf, size_t size)
+{
+	std::lock_guard<std::mutex> lock(mux_mutex);
+	// Packets come in bursts: count their length so the sound plays smooth, and follow the wall clock again
+	// whenever the count drifts 60 ms from it (lost packets, a stall), so it stays with the picture
+	int64_t now = Now90k();
+	if(audio_next_pts < 0 || now - audio_next_pts > 5400 || audio_next_pts - now > 5400)
+		audio_next_pts = now;
+	Send(1, buf, size, audio_next_pts, true);
+	audio_next_pts += audio_frame_90k;
+}
 
+void Passthrough::Send(int stream, const uint8_t *buf, size_t size, int64_t pts, bool key)
+{
+	if(!size)
+		return;
+	if(pts <= last_pts[stream])
+		pts = last_pts[stream] + 1;
+	last_pts[stream] = pts;
 	packet->data = const_cast<uint8_t *>(buf);
 	packet->size = (int)size;
-	packet->stream_index = 0;
+	packet->stream_index = stream;
 	packet->pts = packet->dts = pts;
 	packet->flags = key ? AV_PKT_FLAG_KEY : 0;
 	int err = av_write_frame(mux, packet);
